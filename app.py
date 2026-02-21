@@ -113,11 +113,19 @@ def show_dashboard() -> None:
 
     # display selected sheet using only Streamlit display functions
     df = get_sheet(data, sheet)
-    st.dataframe(df)
+    # hide ID in the UI for the members sheet while keeping df unchanged
+    display_df = df.copy()
+    if sheet == "members" and 'ID' in display_df.columns:
+        display_df = display_df.drop(columns=['ID'])
+    st.dataframe(display_df)
     # render top-10 members by Points below the table
     show_top_members_chart(df)
     # allow logging points for the displayed members sheet
     df = add_points_form(df)
+    # allow adding a new member
+    df = add_member(df)
+    # allow creating an event attendance sheet entry
+    create_event_form(df)
 
 
 # ----------------
@@ -195,6 +203,57 @@ def save_data(df_members: pd.DataFrame, path: str = "data/members.xlsx") -> None
         raise
 
 
+def save_attendance(df_attendance: pd.DataFrame, path: str = "data/members.xlsx", extra_sheets: dict = None) -> None:
+    """Save the `event_attendance` sheet back to the Excel workbook.
+
+    If the file exists, preserve other sheets and overwrite the `event_attendance` sheet.
+    If the file or sheet does not exist, create it.
+    """
+    try:
+        sheets = pd.read_excel(path, sheet_name=None, engine="openpyxl")
+    except FileNotFoundError:
+        sheets = {}
+
+    sheets["event_attendance"] = df_attendance.copy()
+
+    # Ensure any extra sheets provided by the caller are included (e.g., current `members` DataFrame)
+    if extra_sheets:
+        for k, v in extra_sheets.items():
+            # overwrite or add the extra sheet with the provided DataFrame
+            sheets[k] = v.copy()
+
+    # Ensure directory exists
+    dirpath = os.path.dirname(path) or "."
+    os.makedirs(dirpath, exist_ok=True)
+
+    tmp_name = None
+    try:
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx", dir=dirpath)
+        tmp_name = tmp.name
+        tmp.close()
+        with pd.ExcelWriter(tmp_name, engine="openpyxl", mode="w") as writer:
+            for name, df in sheets.items():
+                df.to_excel(writer, sheet_name=name, index=False)
+
+        os.replace(tmp_name, path)
+    except PermissionError as e:
+        try:
+            if tmp_name and os.path.exists(tmp_name):
+                os.remove(tmp_name)
+        except Exception:
+            pass
+        raise PermissionError(
+            f"Permission denied while saving '{path}'. The file may be open in Excel or locked by another process. Close any program using the file and try again. Original error: {e}"
+        ) from e
+    except Exception:
+        try:
+            if tmp_name and os.path.exists(tmp_name):
+                os.remove(tmp_name)
+        except Exception:
+            pass
+        raise
+
+
 # ----------------
 # Interface helper: points form
 # ----------------
@@ -210,13 +269,18 @@ def add_points_form(df_members: pd.DataFrame) -> pd.DataFrame:
 
     with st.form("log_points_form"):
         student_id = st.text_input("Student ID", value="")
-        pts = st.number_input("Points to Add", min_value=1, step=1, value=1)
+        # allow negative entries but warn; enforce an absolute cap to prevent extreme values
+        pts = st.number_input("Points to Add", min_value=-9999, max_value=9999, step=1, value=1)
         submitted = st.form_submit_button("Log Points")
 
     if submitted:
         if not student_id or str(student_id).strip() == "":
             st.error("Student ID is required.")
             return df_members
+
+        # warn on unusual point values but allow the operation to proceed
+        if int(pts) < 0 or int(pts) > 9999:
+            st.warning("Points value is outside the recommended range (0–9999). Proceeding anyway.")
 
         df_members, ok = log_points(df_members, student_id, int(pts))
         if not ok:
@@ -242,6 +306,182 @@ def add_points_form(df_members: pd.DataFrame) -> pd.DataFrame:
             return df_members
 
     return df_members
+
+
+def add_member(df_members: pd.DataFrame) -> pd.DataFrame:
+    """Show a form to add a new member.
+
+    - Validates non-blank `Student ID` and `Name` inputs.
+    - Optional `Base Points` (default 0).
+    - Checks for duplicate `StudentID` in the provided DataFrame and shows a specific error.
+    - On success: appends the new member row to `df_members`, calls `save_data`, clears cache, and shows success message.
+    - Returns the (possibly updated) DataFrame.
+    """
+    st.subheader("Add New Member")
+
+    with st.form("add_member_form"):
+        student_id = st.text_input("Student ID", value="")
+        name = st.text_input("Name", value="")
+        base_points = st.number_input("Base Points (optional)", min_value=0, max_value=9999, step=1, value=0)
+        submitted = st.form_submit_button("Add Member")
+
+    if submitted:
+        # sanitize and validate required fields (no logic functions called here)
+        student_id = str(student_id).strip()
+        name = str(name).strip()
+        try:
+            base_points_int = int(base_points)
+        except Exception:
+            st.error("Base Points must be an integer.")
+            return df_members
+
+        # If StudentID left blank, auto-generate a new unique numeric ID
+        if student_id == "":
+            generated_id = None
+            try:
+                if df_members is not None and 'StudentID' in df_members.columns:
+                    # attempt to parse existing IDs as integers and pick max+1
+                    nums = pd.to_numeric(df_members['StudentID'], errors='coerce')
+                    if nums.notna().any():
+                        max_id = int(nums.max())
+                        generated_id = str(max_id + 1)
+                    else:
+                        # fallback to simple incremental ID based on row count
+                        generated_id = str(len(df_members) + 1)
+                else:
+                    generated_id = "1"
+            except Exception:
+                generated_id = "1"
+
+            student_id = generated_id
+            st.info(f"Assigned Student ID {student_id}.")
+        if name == "":
+            st.error("Name is required.")
+            return df_members
+
+        # base points edge cases
+        # warn on base points edge cases but allow creation to proceed
+        if base_points_int < 0 or base_points_int > 9999:
+            st.warning("Base Points is outside the recommended range (0–9999). The member will be created with this value.")
+
+        # additional simple edge checks
+        if "\n" in student_id or "\r" in student_id:
+            st.error("Student ID must not contain newlines.")
+            return df_members
+        if len(student_id) > 100:
+            st.error("Student ID is too long (max 100 characters).")
+            return df_members
+        if len(name) > 200:
+            st.error("Name is too long (max 200 characters).")
+            return df_members
+
+        # check duplicate StudentID (exact match)
+        if df_members is not None and 'StudentID' in df_members.columns:
+            dup_mask = df_members['StudentID'].astype(str) == student_id
+            if dup_mask.any():
+                st.error(f"Student ID '{student_id}' already exists.")
+                return df_members
+
+        # append new row
+        new_row = {
+            'StudentID': student_id,
+            'Name': name,
+            'Points': base_points_int,
+        }
+
+        try:
+            new_df = pd.concat([df_members, pd.DataFrame([new_row])], ignore_index=True)
+        except Exception:
+            # fallback: if df_members is None or concat fails, create new DataFrame
+            new_df = pd.DataFrame([new_row])
+
+        # persist and instruct user to refresh
+        try:
+            save_data(new_df)
+            try:
+                st.cache_data.clear()
+            except Exception:
+                pass
+            st.success("Member added successfully. Click 'Refresh Data' to update the table.")
+            # set flag so dashboard can show persistent message if needed
+            st.session_state["points_logged_success"] = False
+            st.session_state["member_added_success"] = True
+        except Exception as e:
+            st.error(f"Failed to save new member: {e}")
+            return df_members
+
+        return new_df
+
+    return df_members
+
+
+def create_event_form(df_members: pd.DataFrame) -> None:
+    """Show a form to create a new event attendance entries.
+
+    - Reads existing `event_attendance` from the workbook (if present).
+    - Presents `Event Name` and `Attendees` (multiselect of member Names).
+    - On submit: resolves Names to StudentIDs, appends rows to attendance, calls `save_attendance`, and shows success.
+    """
+    st.subheader("Create Event")
+
+    # Build attendee choices from df_members
+    names = []
+    if df_members is not None and 'Name' in df_members.columns:
+        names = df_members['Name'].dropna().astype(str).tolist()
+
+    with st.form("create_event_form"):
+        event_name = st.text_input("Event Name", value="")
+        attendees = st.multiselect("Attendees", options=names)
+        submitted = st.form_submit_button("Create Event")
+
+    if not submitted:
+        return
+
+    event_name = str(event_name).strip()
+    if event_name == "":
+        st.error("Event Name is required.")
+        return
+
+    if not attendees:
+        st.error("Select at least one attendee.")
+        return
+
+    # Resolve selected Names to StudentIDs (allow duplicates: multiple students with same name)
+    rows = []
+    for name in attendees:
+        matches = df_members[df_members['Name'].astype(str) == str(name)]
+        if matches.empty:
+            # No matching student; skip or report — we will skip and continue
+            continue
+        for sid in matches['StudentID'].tolist():
+            rows.append({'Event': event_name, 'StudentID': sid})
+
+    if not rows:
+        st.error("No valid StudentIDs resolved for selected attendees.")
+        return
+
+    # Load existing attendance sheet if present
+    path = "data/members.xlsx"
+    try:
+        existing = pd.read_excel(path, sheet_name='event_attendance', engine='openpyxl')
+    except Exception:
+        existing = pd.DataFrame(columns=['Event', 'StudentID'])
+
+    try:
+        new_att = pd.concat([existing, pd.DataFrame(rows)], ignore_index=True)
+    except Exception:
+        new_att = pd.DataFrame(rows)
+
+    try:
+        # pass current members DF to ensure members sheet is preserved when writing
+        save_attendance(new_att, extra_sheets={'members': df_members})
+        try:
+            st.cache_data.clear()
+        except Exception:
+            pass
+        st.success("Event created successfully.")
+    except Exception as e:
+        st.error(f"Failed to save attendance: {e}")
 
 
 if __name__ == "__main__":
