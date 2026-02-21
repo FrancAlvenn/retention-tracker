@@ -1,3 +1,6 @@
+# app_v2.py
+# This version of the app is refactored to follow a clean architecture approach, separating concerns into data, logic, and interface layers. The data loading and processing functions are decoupled from the Streamlit UI code, making it easier to maintain and test each layer independently.
+
 import streamlit as st
 import pandas as pd
 from typing import Dict, List
